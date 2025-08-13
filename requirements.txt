@@ -3,7 +3,7 @@ PyPDF2
 openai
 faiss-cpu
 langchain
-langchain_openai
+langchain-openai
 langchain-community
-python-dotenv
 sentence-transformers
+python-dotenv
