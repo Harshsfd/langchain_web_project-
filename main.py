@@ -1,13 +1,3 @@
-# main.py
-"""
-Streamlit PDF Q&A app (no LangChain)
-- Upload PDF(s)
-- Extract text, split into chunks
-- Create embeddings (OpenAI or local SentenceTransformers)
-- Build FAISS index and cache in session
-- Answer queries using retrieved context + OpenAI chat
-"""
-
 import os
 import time
 import math
@@ -20,335 +10,456 @@ import numpy as np
 import faiss
 import openai
 from dotenv import load_dotenv
-from tqdm import tqdm
 
 # Optional local embedding (sentence-transformers)
 LOCAL_EMBEDDINGS_AVAILABLE = False
 try:
     from sentence_transformers import SentenceTransformer
     LOCAL_EMBEDDINGS_AVAILABLE = True
-except Exception:
+except ImportError:
     LOCAL_EMBEDDINGS_AVAILABLE = False
 
-# Load local .env in dev (Streamlit Secrets will override in cloud)
+# Load environment variables
 load_dotenv()
 
-# ---------- Helper utilities ----------
+# ---------- Helper Utilities ----------
 def get_openai_api_key():
-    # First check Streamlit secrets, else environment
-    key = None
+    """Get OpenAI API key from Streamlit secrets or environment."""
     try:
-        key = st.secrets["OPENAI_API_KEY"]
-    except Exception:
-        key = os.getenv("OPENAI_API_KEY")
-    return key
+        return st.secrets["OPENAI_API_KEY"]
+    except (Exception, KeyError):
+        return os.getenv("OPENAI_API_KEY")
 
-def safe_sleep(backoff):
-    time.sleep(backoff)
+def safe_sleep(seconds):
+    """Sleep with progress indication."""
+    with st.spinner(f"Waiting {seconds} seconds..."):
+        time.sleep(seconds)
 
-def retry_with_backoff(func, *args, retries=6, initial_delay=1.0, factor=2.0, **kwargs):
+def retry_with_backoff(func, *args, retries=5, initial_delay=1.0, backoff_factor=2.0, **kwargs):
+    """
+    Retry a function with exponential backoff.
+    Handles rate limits and transient errors.
+    """
     delay = initial_delay
-    for i in range(retries):
+    for attempt in range(retries):
         try:
             return func(*args, **kwargs)
         except Exception as e:
-            msg = str(e).lower()
-            # Retry on typical transient errors (rate limit, timeout, connection)
-            if any(tok in msg for tok in ("rate limit", "429", "timeout", "timed out", "service unavailable", "connection")):
-                if i == retries - 1:
-                    raise
+            if attempt == retries - 1:
+                raise
+            error_msg = str(e).lower()
+            if any(tok in error_msg for tok in ("rate limit", "429", "timeout", "connection")):
+                st.warning(f"Attempt {attempt + 1}/{retries} failed. Retrying in {delay:.1f}s...")
                 safe_sleep(delay)
-                delay *= factor
-                continue
+                delay *= backoff_factor
             else:
                 raise
 
-# ---------- PDF text extraction ----------
+# ---------- PDF Processing ----------
 def extract_texts_from_pdfs(uploaded_files) -> List[str]:
+    """Extract text from uploaded PDF files, handling encrypted PDFs."""
     texts = []
-    for f in uploaded_files:
+    for file in uploaded_files:
         try:
-            reader = PdfReader(f)
+            reader = PdfReader(file)
+            
+            # Handle encrypted PDFs
+            if reader.is_encrypted:
+                try:
+                    reader.decrypt("")  # Try empty password
+                except Exception:
+                    st.warning(f"Skipped encrypted PDF: {getattr(file, 'name', 'file')}")
+                    continue
+            
+            # Extract text from each page
             pages = []
-            for p in reader.pages:
-                page_text = p.extract_text()
-                if page_text:
-                    pages.append(page_text)
-            text = "\n".join(pages).strip()
-            if text:
-                texts.append(text)
-            else:
-                st.warning(f"No readable text found in {getattr(f, 'name', 'file')}. It may be scanned or image-only.")
+            for page in reader.pages:
+                page_text = page.extract_text() or ""  # Fallback to empty string
+                pages.append(page_text.strip())
+            
+            full_text = "\n".join(pages).strip()
+            if full_text:
+                texts.append(full_text)
+            
+            # Rewind file for later use
+            file.seek(0)
+            
         except Exception as e:
-            st.warning(f"Failed to read {getattr(f, 'name', 'file')}: {e}")
+            st.warning(f"Could not read {getattr(file, 'name', 'file')}: {str(e)}")
     return texts
 
-# ---------- Chunking ----------
 def split_text_into_chunks(text: str, chunk_size: int, overlap: int) -> List[str]:
+    """Split text into overlapping chunks."""
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive")
+    
     chunks = []
     start = 0
-    text_len = len(text)
-    while start < text_len:
-        end = min(start + chunk_size, text_len)
+    text_length = len(text)
+    
+    while start < text_length:
+        end = min(start + chunk_size, text_length)
         chunk = text[start:end]
         chunks.append(chunk)
-        if end == text_len:
+        
+        if end == text_length:
             break
+            
         start = end - overlap
         if start < 0:
             start = 0
+    
     return chunks
 
-def build_all_chunks(texts: List[str], chunk_size: int, overlap: int, max_chunks: int) -> List[Tuple[str,int,int]]:
-    # returns list of (chunk_text, source_doc_index, chunk_index_in_doc)
+def build_all_chunks(texts: List[str], chunk_size: int, overlap: int, max_chunks: int) -> List[Tuple[str, int, int]]:
+    """Build chunks from all texts with metadata."""
     all_chunks = []
-    for doc_idx, t in enumerate(texts):
-        chunks = split_text_into_chunks(t, chunk_size, overlap)
-        for i, c in enumerate(chunks):
-            all_chunks.append((c, doc_idx, i))
+    for doc_idx, text in enumerate(texts):
+        chunks = split_text_into_chunks(text, chunk_size, overlap)
+        for chunk_idx, chunk in enumerate(chunks):
             if len(all_chunks) >= max_chunks:
                 return all_chunks
+            all_chunks.append((chunk, doc_idx, chunk_idx))
     return all_chunks
 
 # ---------- Embeddings ----------
 def openai_embed_batch(texts: List[str], model="text-embedding-3-small", batch_size=32, api_key=None) -> List[List[float]]:
-    if api_key is None:
-        raise ValueError("OpenAI API key required for OpenAI embeddings")
+    """Get embeddings from OpenAI API."""
+    if not api_key:
+        raise ValueError("OpenAI API key required")
+    
     openai.api_key = api_key
     embeddings = []
+    
     for i in range(0, len(texts), batch_size):
         batch = texts[i:i+batch_size]
-        def call():
-            return openai.Embedding.create(model=model, input=batch)
-        resp = retry_with_backoff(call)
-        for item in resp["data"]:
-            embeddings.append(item["embedding"])
+        
+        def call_api():
+            return openai.Embedding.create(
+                model=model,
+                input=batch
+            )
+        
+        response = retry_with_backoff(call_api)
+        embeddings.extend([item["embedding"] for item in response["data"]])
+    
     return embeddings
 
-def local_embed_batch(texts: List[str], model_name="sentence-transformers/all-MiniLM-L6-v2", batch_size=64):
+def local_embed_batch(texts: List[str], model_name="sentence-transformers/all-MiniLM-L6-v2", batch_size=16):
+    """Get embeddings from local model."""
     if not LOCAL_EMBEDDINGS_AVAILABLE:
-        raise RuntimeError("Local embedding model not installed. Add sentence-transformers & torch to requirements.")
+        raise RuntimeError("Local embeddings require sentence-transformers")
+    
     model = SentenceTransformer(model_name)
-    embs = model.encode(texts, show_progress_bar=False, batch_size=batch_size)
-    return embs.tolist()
+    embeddings = model.encode(texts, show_progress_bar=True, batch_size=batch_size)
+    return embeddings.tolist()
 
-# ---------- FAISS helpers ----------
+# ---------- FAISS Index ----------
 def create_faiss_index(embeddings: List[List[float]]) -> faiss.IndexFlatL2:
-    dim = len(embeddings[0])
-    index = faiss.IndexFlatL2(dim)
-    arr = np.array(embeddings).astype("float32")
-    index.add(arr)
+    """Create FAISS index from embeddings."""
+    if not embeddings:
+        raise ValueError("No embeddings provided")
+    
+    dimension = len(embeddings[0])
+    index = faiss.IndexFlatL2(dimension)
+    index.add(np.array(embeddings).astype("float32"))
     return index
 
-# A helper to compute a stable cache key from files + settings
-def compute_index_key(uploaded_files, chunk_size, overlap, model_key, max_chunks):
+def compute_index_key(uploaded_files, chunk_size, overlap, model_key, max_chunks) -> str:
+    """Compute stable cache key from files and settings."""
     h = hashlib.sha256()
+    h.update(str(time.time()).encode())  # Include timestamp
     h.update(str(chunk_size).encode())
     h.update(str(overlap).encode())
     h.update(str(max_chunks).encode())
     h.update(model_key.encode())
-    for f in uploaded_files:
-        # include filename + size + last bytes for small change detection
-        name = getattr(f, "name", "") or ""
+    
+    for file in uploaded_files:
         try:
-            f.seek(0)
-            data = f.read()
-            f.seek(0)
-            h.update(name.encode())
+            file.seek(0)
+            data = file.read()  # Read full content
+            file.seek(0)  # Rewind
+            h.update(getattr(file, "name", "").encode())
             h.update(str(len(data)).encode())
-            # add a slice to avoid hashing huge files fully
-            h.update(data[:256] if isinstance(data, (bytes, bytearray)) else str(data)[:256].encode())
-        except Exception:
-            # best-effort
-            h.update(name.encode())
+            # Include hash of first and last 128 bytes
+            h.update(data[:128] if isinstance(data, (bytes, bytearray)) else str(data)[:128].encode())
+            h.update(data[-128:] if isinstance(data, (bytes, bytearray)) else str(data)[-128:].encode())
+        except Exception as e:
+            st.warning(f"Could not hash file {getattr(file, 'name', 'file')}: {str(e)}")
+    
     return h.hexdigest()
 
 # ---------- Retrieval & Answering ----------
-def knn_search(index: faiss.IndexFlatL2, query_emb: List[float], top_k: int=4) -> List[int]:
-    q = np.array([query_emb]).astype("float32")
-    D, I = index.search(q, top_k)
-    return I[0].tolist()  # indices
-
-def build_prompt_with_context(question: str, retrieved_chunks: List[Tuple[str,int,int]], max_context_chars=3000) -> str:
-    # Compose context from retrieved chunks; limit total size
-    ctx_pieces = []
-    total = 0
-    for chunk, doc_idx, chunk_idx in retrieved_chunks:
-        add_len = len(chunk)
-        if total + add_len > max_context_chars:
-            # trim chunk if needed
-            piece = chunk[: max(0, max_context_chars - total)]
-            ctx_pieces.append(f"Source (doc {doc_idx} chunk {chunk_idx}):\n{piece}")
-            total = max_context_chars
-            break
-        else:
-            ctx_pieces.append(f"Source (doc {doc_idx} chunk {chunk_idx}):\n{chunk}")
-            total += add_len
-    context = "\n\n---\n\n".join(ctx_pieces)
-    prompt = (
-        "You are a helpful assistant that answers questions using only the provided context from the user's documents.\n"
-        "If the answer is not contained in the context, say you don't know or provide best-effort with a clear note.\n\n"
-        f"Context:\n{context}\n\n"
-        f"Question: {question}\n\n"
-        "Answer concisely and reference which Source (doc/chunk) you used when possible."
-    )
-    return prompt
-
-def call_openai_chat(prompt: str, api_key: str, model="gpt-3.5-turbo", temperature=0.0, max_tokens=512):
-    openai.api_key = api_key
-    # messages format
-    messages = [{"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": prompt}]
-    def call():
-        return openai.ChatCompletion.create(model=model, messages=messages, temperature=temperature, max_tokens=max_tokens)
-    resp = retry_with_backoff(call)
-    return resp["choices"][0]["message"]["content"].strip()
-
-# ---------- Streamlit UI & Flow ----------
-st.set_page_config(page_title="PDF Q&A (OpenAI + FAISS)", layout="centered")
-st.title("📄 Document Q&A Chatbot")
-st.write("Upload PDFs and ask questions. This app builds a FAISS index from your docs and retrieves context for answers.")
-
-# Sidebar settings
-with st.sidebar:
-    st.header("Settings")
-    openai_key = get_openai_api_key()
-    st.write("OpenAI key:", "✅ found" if openai_key else "❌ not found")
-    embedding_backend = st.radio("Embeddings backend", ("OpenAI", "Local (sentence-transformers)"))
-    if embedding_backend == "Local (sentence-transformers)":
-        if not LOCAL_EMBEDDINGS_AVAILABLE:
-            st.error("Local embeddings not available. Install sentence-transformers & torch.")
-    chunk_size = st.slider("Chunk size (chars)", 200, 2000, 1000, step=50)
-    chunk_overlap = st.slider("Chunk overlap (chars)", 0, 500, 200, step=10)
-    max_chunks = st.number_input("Max chunks to embed", min_value=50, max_value=10000, value=2000, step=50)
-    batch_size = st.number_input("Embedding batch size", min_value=1, max_value=256, value=32, step=1)
-    top_k = st.number_input("Retrieval top_k", min_value=1, max_value=10, value=4, step=1)
-    # LLM selection
-    llm_model = st.selectbox("LLM model for answers", ("gpt-3.5-turbo", "gpt-4o-mini", "gpt-4o"), index=0)
-    st.markdown("---")
-    st.write("Notes:")
-    st.write("- For large documents, consider Local embeddings to reduce OpenAI cost / rate-limits.")
-    st.write("- On Streamlit Cloud, add OPENAI_API_KEY in Settings → Secrets.")
-
-# File uploader
-uploaded_files = st.file_uploader("📂 Upload PDF files (multiple allowed)", type=["pdf"], accept_multiple_files=True)
-
-# Process button (explicit)
-process_now = st.button("Process uploaded PDFs into index")
-
-# Auto-process when files uploaded and not yet indexed
-auto_process = False
-if uploaded_files and ("last_upload_count" not in st.session_state or st.session_state.get("last_upload_count") != len(uploaded_files)):
-    # mark change and auto-process
-    st.session_state["last_upload_count"] = len(uploaded_files)
-    auto_process = True
-
-if process_now or auto_process:
-    if not uploaded_files:
-        st.warning("Upload one or more PDFs first.")
-    else:
-        st.info("Extracting text from PDFs...")
-        texts = extract_texts_from_pdfs(uploaded_files)
-        if not texts:
-            st.error("No readable text extracted from uploaded PDFs.")
-            st.stop()
-
-        st.info("Splitting into chunks...")
-        raw_chunks = build_all_chunks(texts, chunk_size, chunk_overlap, int(max_chunks))
-        chunk_texts = [c for (c, _, _) in raw_chunks]
-        st.write(f"Built {len(chunk_texts)} chunks from {len(texts)} documents.")
-
-        # compute index cache key
-        model_key = embedding_backend + ("::openai" if embedding_backend=="OpenAI" else "::local")
-        index_key = compute_index_key(uploaded_files, chunk_size, chunk_overlap, model_key, max_chunks)
-
-        # see if index in session cache
-        if "faiss_index_cache" not in st.session_state:
-            st.session_state.faiss_index_cache = {}
-
-        if index_key in st.session_state.faiss_index_cache:
-            st.success("Found cached index — using it.")
-        else:
-            st.info("Creating embeddings and building FAISS index...")
-            progress = st.progress(0)
-            try:
-                if embedding_backend == "OpenAI":
-                    if not openai_key:
-                        st.error("OpenAI API key missing. Set OPENAI_API_KEY in env or Streamlit Secrets.")
-                        st.stop()
-                    # openai embedding model
-                    emb_model = "text-embedding-3-small"
-                    embeddings = openai_embed_batch(chunk_texts, model=emb_model, batch_size=int(batch_size), api_key=openai_key)
-                else:
-                    if not LOCAL_EMBEDDINGS_AVAILABLE:
-                        st.error("Local embeddings not available on this system.")
-                        st.stop()
-                    embeddings = local_embed_batch(chunk_texts, batch_size=int(batch_size))
-
-                # build faiss index
-                st.info("Indexing embeddings into FAISS...")
-                index = create_faiss_index(embeddings)
-                # store metadata: texts list, and mapping indices -> (text, doc_idx, chunk_idx)
-                meta = {
-                    "chunks_meta": raw_chunks,  # list of (text, doc_idx, chunk_idx)
-                    "texts": chunk_texts
-                }
-                st.session_state.faiss_index_cache[index_key] = {"index": index, "meta": meta, "embedding_model": emb_model if embedding_backend=="OpenAI" else "local"}
-                st.success("Index built and cached.")
-            except Exception as e:
-                st.exception(e)
-            finally:
-                progress.empty()
-
-# If any index in cache, let user query
-if "faiss_index_cache" in st.session_state and st.session_state.faiss_index_cache:
-    # choose the most recent index (just pick the last key)
-    last_key = list(st.session_state.faiss_index_cache.keys())[-1]
-    cached = st.session_state.faiss_index_cache[last_key]
-    index = cached["index"]
-    meta = cached["meta"]
-    st.write("Index ready. You can now ask questions.")
-    question = st.text_input("💬 Ask a question about the uploaded documents:")
-    if st.button("Get Answer") and question:
-        # embed the question
-        try:
-            if embedding_backend == "OpenAI":
-                if not openai_key:
-                    st.error("OpenAI key missing.")
-                    st.stop()
-                q_emb = openai_embed_batch([question], model=cached.get("embedding_model","text-embedding-3-small"), batch_size=1, api_key=openai_key)[0]
-            else:
-                if not LOCAL_EMBEDDINGS_AVAILABLE:
-                    st.error("Local embeddings not available.")
-                    st.stop()
-                q_emb = local_embed_batch([question], batch_size=1)[0]
-
-            # search
-            idxs = knn_search(index, q_emb, top_k=int(top_k))
-            retrieved = []
-            for i in idxs:
-                if i < len(meta["chunks_meta"]):
-                    retrieved.append(meta["chunks_meta"][i])
-            # build prompt
-            prompt = build_prompt_with_context(question, retrieved)
-            st.write("## Retrieved context:")
-            for (c, didx, cidx) in retrieved:
-                st.write(f"- Doc {didx} chunk {cidx} — {len(c)} chars")
-            # call LLM
-            if not openai_key:
-                st.error("OpenAI key required to generate answer. Add it in Streamlit Secrets or environment.")
-                st.stop()
-            answer = call_openai_chat(prompt, api_key=openai_key, model=llm_model)
-            st.write("### Answer")
-            st.write(answer)
-        except Exception as e:
-            st.exception(e)
-else:
-    st.info("No index yet. Upload PDFs and click 'Process uploaded PDFs into index' (or upload to auto-process).")
-
-# small footer
-st.markdown("---")
-st.caption("This app builds a local FAISS index for retrieval and uses OpenAI chat to answer. Use Local embeddings to avoid embedding API costs.")
+def knn_search(index: faiss.IndexFlatL2, query_emb: List[float], top_k: int = 4) -> List[int]:
+    """Find top-k similar embeddings."""
+    if not query_emb:
+        raise ValueError("Empty query embedding")
     
+    distances, indices = index.search(np.array([query_emb]).astype("float32"), top_k)
+    return indices[0].tolist()
+
+def build_prompt_with_context(question: str, retrieved_chunks: List[Tuple[str, int, int]], max_context_chars=3000) -> str:
+    """Build LLM prompt with retrieved context."""
+    context_parts = []
+    total_length = 0
+    
+    for chunk, doc_idx, chunk_idx in retrieved_chunks:
+        chunk_length = len(chunk)
+        remaining_space = max_context_chars - total_length
+        
+        if remaining_space <= 0:
+            break
+            
+        if chunk_length > remaining_space:
+            chunk = chunk[:remaining_space]
+            chunk_length = remaining_space
+            
+        context_parts.append(
+            f"Source (Document {doc_idx + 1}, Chunk {chunk_idx + 1}):\n{chunk}"
+        )
+        total_length += chunk_length
+    
+    context = "\n\n---\n\n".join(context_parts)
+    
+    return f"""You are a helpful assistant that answers questions using only the provided context.
+If the answer isn't in the context, say you don't know but suggest related information.
+
+Context:
+{context}
+
+Question: {question}
+
+Answer concisely in 1-3 paragraphs. Cite sources when possible."""
+
+def call_openai_chat(prompt: str, api_key: str, model="gpt-3.5-turbo", temperature=0.1, max_tokens=1000):
+    """Query OpenAI chat model."""
+    if not api_key:
+        raise ValueError("OpenAI API key required")
+    
+    openai.api_key = api_key
+    messages = [
+        {"role": "system", "content": "You are a helpful research assistant."},
+        {"role": "user", "content": prompt}
+    ]
+    
+    def chat_completion():
+        return openai.ChatCompletion.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens
+        )
+    
+    response = retry_with_backoff(chat_completion)
+    return response["choices"][0]["message"]["content"].strip()
+
+# ---------- Streamlit UI ----------
+def main():
+    st.set_page_config(
+        page_title="PDF Q&A Assistant",
+        page_icon="📚",
+        layout="centered"
+    )
+    
+    st.title("📚 Document Q&A Assistant")
+    st.write("Upload PDFs and ask questions about their content.")
+    
+    # Initialize session state
+    if "faiss_index_cache" not in st.session_state:
+        st.session_state.faiss_index_cache = {}
+    
+    # Sidebar settings
+    with st.sidebar:
+        st.header("Settings")
+        
+        # API key and model selection
+        openai_key = get_openai_api_key()
+        st.write(f"OpenAI key: {'✅' if openai_key else '❌'}")
+        
+        embedding_backend = st.radio(
+            "Embeddings backend",
+            ["OpenAI", "Local (sentence-transformers)"],
+            index=0,
+            disabled=not LOCAL_EMBEDDINGS_AVAILABLE
+        )
+        
+        if embedding_backend == "Local (sentence-transformers)" and not LOCAL_EMBEDDINGS_AVAILABLE:
+            st.error("Install sentence-transformers for local embeddings")
+        
+        # Document processing settings
+        st.subheader("Document Processing")
+        chunk_size = st.slider("Chunk size (characters)", 200, 2000, 800, 50)
+        chunk_overlap = st.slider("Chunk overlap (characters)", 0, 500, 200, 10)
+        max_chunks = st.number_input("Maximum chunks", 100, 10000, 2000, 50)
+        
+        # Embedding settings
+        st.subheader("Embedding Settings")
+        batch_size = st.number_input(
+            "Batch size",
+            1,
+            256,
+            value=16 if embedding_backend == "Local (sentence-transformers)" else 32,
+            step=1
+        )
+        top_k = st.number_input("Retrieve top-k chunks", 1, 10, 4, 1)
+        
+        # LLM settings
+        st.subheader("Answer Generation")
+        llm_model = st.selectbox(
+            "LLM Model",
+            ["gpt-3.5-turbo", "gpt-4", "gpt-4-turbo"],
+            index=0
+        )
+        
+        st.markdown("---")
+        st.caption("Note: Large documents may take time to process.")
+    
+    # File uploader
+    uploaded_files = st.file_uploader(
+        "Upload PDF documents",
+        type=["pdf"],
+        accept_multiple_files=True,
+        help="Upload one or more PDF files to analyze"
+    )
+    
+    # Early validation for OpenAI key
+    if embedding_backend == "OpenAI" and not openai_key:
+        st.error("🔑 OpenAI API key required. Set OPENAI_API_KEY in secrets.")
+        st.stop()
+    
+    # Process documents when files are uploaded
+    if uploaded_files and st.button("Process Documents", type="primary"):
+        with st.spinner("Processing documents..."):
+            try:
+                # Extract text from PDFs
+                texts = extract_texts_from_pdfs(uploaded_files)
+                if not texts:
+                    st.error("No readable text extracted from documents")
+                    st.stop()
+                
+                # Split into chunks
+                raw_chunks = build_all_chunks(texts, chunk_size, chunk_overlap, max_chunks)
+                chunk_texts = [chunk for chunk, _, _ in raw_chunks]
+                
+                st.success(f"Processed {len(chunk_texts)} chunks from {len(texts)} documents")
+                
+                # Compute cache key
+                model_key = f"{embedding_backend}::{embedding_backend.lower()}"
+                index_key = compute_index_key(uploaded_files, chunk_size, chunk_overlap, model_key, max_chunks)
+                
+                # Check cache
+                if index_key in st.session_state.faiss_index_cache:
+                    st.info("Using cached embeddings")
+                else:
+                    # Create embeddings
+                    with st.spinner("Creating embeddings..."):
+                        progress_bar = st.progress(0)
+                        
+                        try:
+                            if embedding_backend == "OpenAI":
+                                embeddings = openai_embed_batch(
+                                    chunk_texts,
+                                    batch_size=batch_size,
+                                    api_key=openai_key
+                                )
+                                emb_model = "text-embedding-3-small"
+                            else:
+                                embeddings = local_embed_batch(
+                                    chunk_texts,
+                                    batch_size=batch_size
+                                )
+                                emb_model = "sentence-transformers/all-MiniLM-L6-v2"
+                            
+                            # Build FAISS index
+                            with st.spinner("Building search index..."):
+                                index = create_faiss_index(embeddings)
+                                
+                                # Store in cache
+                                st.session_state.faiss_index_cache[index_key] = {
+                                    "index": index,
+                                    "meta": {
+                                        "chunks_meta": raw_chunks,
+                                        "texts": chunk_texts,
+                                        "embedding_model": emb_model
+                                    }
+                                }
+                            
+                            st.success("Index created successfully")
+                            
+                        except Exception as e:
+                            st.error(f"Failed to create embeddings: {str(e)}")
+                            raise
+                        finally:
+                            progress_bar.empty()
+            
+            except Exception as e:
+                st.error(f"Document processing failed: {str(e)}")
+                st.stop()
+    
+    # Question answering section
+    if "faiss_index_cache" in st.session_state and st.session_state.faiss_index_cache:
+        st.divider()
+        st.subheader("Ask a Question")
+        
+        # Get the latest index
+        latest_key = list(st.session_state.faiss_index_cache.keys())[-1]
+        cache_data = st.session_state.faiss_index_cache[latest_key]
+        index = cache_data["index"]
+        meta = cache_data["meta"]
+        
+        question = st.text_input("Enter your question:")
+        
+        if st.button("Get Answer") and question:
+            with st.spinner("Searching documents..."):
+                try:
+                    # Embed the question
+                    if embedding_backend == "OpenAI":
+                        q_embedding = openai_embed_batch(
+                            [question],
+                            model="text-embedding-3-small",
+                            batch_size=1,
+                            api_key=openai_key
+                        )[0]
+                    else:
+                        q_embedding = local_embed_batch([question], batch_size=1)[0]
+                    
+                    # Retrieve relevant chunks
+                    chunk_indices = knn_search(index, q_embedding, top_k)
+                    retrieved_chunks = []
+                    for idx in chunk_indices:
+                        if idx < len(meta["chunks_meta"]):
+                            retrieved_chunks.append(meta["chunks_meta"][idx])
+                    
+                    if not retrieved_chunks:
+                        st.warning("No relevant content found")
+                        st.stop()
+                    
+                    # Show retrieved chunks
+                    with st.expander("View Retrieved Context"):
+                        for chunk, doc_idx, chunk_idx in retrieved_chunks:
+                            st.caption(f"Document {doc_idx + 1}, Chunk {chunk_idx + 1}")
+                            st.text(chunk[:500] + ("..." if len(chunk) > 500 else ""))
+                            st.divider()
+                    
+                    # Generate answer
+                    with st.spinner("Generating answer..."):
+                        prompt = build_prompt_with_context(question, retrieved_chunks)
+                        answer = call_openai_chat(
+                            prompt,
+                            api_key=openai_key,
+                            model=llm_model
+                        )
+                        
+                        st.subheader("Answer")
+                        st.write(answer)
+                
+                except Exception as e:
+                    st.error(f"Failed to generate answer: {str(e)}")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        st.error(f"Application error: {str(e)}")
+        st.stop()
+                    
