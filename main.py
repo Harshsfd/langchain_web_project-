@@ -250,5 +250,6 @@ def build_chain(vs):
     retriever = make_retriever(vs, k=4)
     # RetrievalQA expects a retriever with get_relevant_documents
     if RetrievalQA is None:
-        raise RuntimeError("R
+        raise RuntimeError("Runtime error occurred")
+
     
