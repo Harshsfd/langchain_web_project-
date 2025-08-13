@@ -16,3 +16,19 @@ uvicorn==0.30.6
 pydantic==2.8.2
 requests==2.32.3
 numpy==1.26.4
+
+# Core Dependencies
+streamlit>=1.36.0
+PyPDF2>=3.0.0
+faiss-cpu==1.8.0
+openai>=0.28.0
+python-dotenv>=1.0.0
+numpy>=1.26.0
+sentence-transformers>=2.6.0
+
+# Optional/Dev Dependencies (commented out)
+# langchain==0.2.14  # Not used in current implementation
+# fastapi==0.112.1   # Only needed if adding API endpoints
+# uvicorn==0.30.6    # Only needed for FastAPI server
+# pydantic==2.8.2    # Not directly used in your code
+# requests==2.32.3   # Not needed as OpenAI handles requests
